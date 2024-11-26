@@ -1,0 +1,316 @@
+import os
+import sys
+import numpy as np
+import pandas as pd
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+# Define a custom Dataset
+class PackagingDataset(Dataset):
+    def __init__(self, X, y):
+        """
+        Args:
+            X (numpy.ndarray): Input features of shape (samples, sequence_length, features).
+            y (numpy.ndarray): Labels of shape (samples,).
+        """
+        self.X = torch.tensor(X, dtype=torch.float32)  # Convert to torch.Tensor
+        self.y = torch.tensor(y, dtype=torch.float32)  # Convert to torch.Tensor
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+# Define the LSTM-based Neural Network Model
+class LSTMClassifier(nn.Module):
+    def __init__(self, input_size, hidden_size, num_layers, dropout):
+        """
+        Args:
+            input_size (int): Number of input features.
+            hidden_size (int): Number of features in the hidden state.
+            num_layers (int): Number of recurrent layers.
+            dropout (float): Dropout rate between LSTM layers.
+        """
+        super(LSTMClassifier, self).__init__()
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+
+        # LSTM layer
+        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, 
+                            batch_first=True, dropout=dropout)
+
+        # Dropout layer for regularization
+        self.dropout = nn.Dropout(dropout)
+
+        # Fully connected layer
+        self.fc = nn.Linear(hidden_size, 1)
+
+        # Sigmoid activation for binary classification
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        """
+        Forward pass of the model.
+        
+        Args:
+            x (torch.Tensor): Input tensor of shape (batch_size, sequence_length, input_size).
+        
+        Returns:
+            torch.Tensor: Output probabilities of shape (batch_size,).
+        """
+        # Initialize hidden state and cell state with zeros
+        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)  # (num_layers, batch, hidden_size)
+        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)  # (num_layers, batch, hidden_size)
+
+        # Forward propagate LSTM
+        out, _ = self.lstm(x, (h0, c0))  # out: (batch_size, sequence_length, hidden_size)
+
+        # Take the output from the last time step
+        out = out[:, -1, :]  # (batch_size, hidden_size)
+
+        # Apply dropout
+        out = self.dropout(out)
+
+        # Pass through the fully connected layer
+        out = self.fc(out)  # (batch_size, 1)
+
+        # Apply sigmoid activation
+        out = self.sigmoid(out)  # (batch_size, 1)
+
+        return out.squeeze()  # (batch_size,)
+
+# Function to load and preprocess data
+def load_data(data_dir, labels_file):
+    """
+    Loads and preprocesses data from CSV files and their corresponding labels in an Excel file.
+
+    Args:
+        data_dir (str): Path to the directory containing CSV data files.
+        labels_file (str): Path to the Excel file containing labels.
+
+    Returns:
+        tuple: (X_train, y_train, X_val, y_val)
+    """
+    import os
+    import pandas as pd
+    import numpy as np
+    from sklearn.model_selection import train_test_split
+    from sklearn.preprocessing import StandardScaler
+
+    # Check if the data directory exists
+    if not os.path.isdir(data_dir):
+        print(f"Error: The data directory '{data_dir}' does not exist.")
+        sys.exit(1)
+
+    # Check if the labels file exists
+    if not os.path.isfile(labels_file):
+        print(f"Error: The labels file '{labels_file}' does not exist.")
+        sys.exit(1)
+
+    # Load labels from Excel
+    try:
+        labels_df = pd.read_excel(labels_file, header=0)
+    except Exception as e:
+        print(f"Error reading labels file '{labels_file}': {e}")
+        sys.exit(1)
+
+    # Assuming labels are in the first column
+    labels_list = labels_df.iloc[:, 0].tolist()
+    print(f"Loaded {len(labels_list)} labels.")
+
+    # Get list of files in data directory
+    files_list = sorted(os.listdir(data_dir))
+    print(f"Found {len(files_list)} files in data directory.")
+
+    # Ensure the number of files matches the number of labels
+    if len(files_list) != len(labels_list):
+        print(f"Error: Number of files ({len(files_list)}) does not match number of labels ({len(labels_list)}).")
+        sys.exit(1)
+
+    x_train = []
+    y = []
+
+    # Include all six variables
+    data_types = [" fx[N]", " fy[N]", " fz[N]", " mx[Nm]", " my[Nm]", " mz[Nm]"]
+
+    for idx, file_name in enumerate(files_list):
+        file_path = os.path.join(data_dir, file_name)
+        label = labels_list[idx]
+        print(f"Processing file {idx+1}/{len(files_list)}: {file_name} with label {label}")
+
+        try:
+            df = pd.read_csv(file_path)
+        except Exception as e:
+            print(f"Error reading '{file_name}': {e}")
+            sys.exit(1)
+
+        data = []
+        for tst in data_types:
+            if tst not in df.columns:
+                print(f"Error: Column '{tst}' not found in file '{file_name}'.")
+                sys.exit(1)
+            temp = df[tst].values
+            if len(temp) < 210:
+                print(f"Warning: File '{file_name}' has less than 210 rows. Padding with zeros.")
+                temp = np.pad(temp, (0, 210 - len(temp)), 'constant')
+            else:
+                temp = temp[:210]  # Ensure consistent sequence length
+            data.append(temp)
+        x_sample = np.stack(data, axis=1)  # Shape: (210, 6)
+        x_train.append(x_sample)
+
+        # Convert label to binary
+        label_mapping = {'P': 1, 'N': 0}
+        y.append(label_mapping.get(label, 0))
+
+    x_train = np.stack(x_train, axis=0)  # Shape: (num_samples, 210, 6)
+    y = np.array(y)
+
+    # Split into training and validation sets
+    X_train, X_val, y_train, y_val = train_test_split(
+        x_train, y, test_size=0.2, random_state=42, stratify=y
+    )
+
+    # Normalize the data
+    num_train_samples, seq_len, num_features = X_train.shape
+    X_train_reshaped = X_train.reshape(-1, num_features)
+    X_val_reshaped = X_val.reshape(-1, num_features)
+
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train_reshaped)
+    X_val_scaled = scaler.transform(X_val_reshaped)
+
+    # Reshape back to original shape
+    X_train_scaled = X_train_scaled.reshape(num_train_samples, seq_len, num_features)
+    X_val_scaled = X_val_scaled.reshape(X_val.shape[0], seq_len, num_features)
+
+    return X_train_scaled, y_train, X_val_scaled, y_val
+
+
+def main():
+    # Print current working directory
+    print("Current Working Directory:", os.getcwd())
+
+    # Parameters
+    data_dir = "Jigg"  # Path to your data directory
+    labels_file = "Jigg Results.xlsx"  # Path to your labels file
+    batch_size = 32
+    num_epochs = 20
+    learning_rate = 0.001
+
+    # Load and preprocess data
+    X_train, y_train, X_val, y_val = load_data(data_dir, labels_file)
+    print(f"Training samples: {X_train.shape[0]}")
+    print(f"Validation samples: {X_val.shape[0]}")
+
+    # Create Dataset objects
+    train_dataset = PackagingDataset(X_train, y_train)
+    val_dataset = PackagingDataset(X_val, y_val)
+
+    # Create DataLoaders
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+    # Check device
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Define model parameters
+    input_size = X_train.shape[2]  # Number of features (6)
+    hidden_size = 64
+    num_layers = 2
+    dropout = 0.5
+
+    # Initialize the model, loss function, and optimizer
+    model = LSTMClassifier(input_size, hidden_size, num_layers, dropout).to(device)
+    criterion = nn.BCELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+    # Training loop
+    for epoch in range(num_epochs):
+        model.train()
+        train_loss = 0.0
+        correct = 0
+        total = 0
+
+        for X_batch, y_batch in train_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+
+            # Forward pass
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+
+            # Backward pass and optimization
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            train_loss += loss.item() * X_batch.size(0)
+            preds = (outputs >= 0.5).float()
+            correct += (preds == y_batch).sum().item()
+            total += y_batch.size(0)
+
+        epoch_loss = train_loss / total
+        epoch_acc = correct / total
+
+        # Validation
+        model.eval()
+        val_loss = 0.0
+        val_correct = 0
+        val_total = 0
+
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.to(device)
+
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+
+                val_loss += loss.item() * X_batch.size(0)
+                preds = (outputs >= 0.5).float()
+                val_correct += (preds == y_batch).sum().item()
+                val_total += y_batch.size(0)
+
+        val_epoch_loss = val_loss / val_total
+        val_epoch_acc = val_correct / val_total
+
+        print(f"Epoch {epoch+1}/{num_epochs}:")
+        print(f"  Train Loss: {epoch_loss:.4f}, Train Acc: {epoch_acc:.4f}")
+        print(f"  Val Loss: {val_epoch_loss:.4f}, Val Acc: {val_epoch_acc:.4f}")
+
+    # Final Evaluation on Validation Set
+    model.eval()
+    final_loss = 0.0
+    final_correct = 0
+    final_total = 0
+
+    with torch.no_grad():
+        for X_batch, y_batch in val_loader:
+            X_batch = X_batch.to(device)
+            y_batch = y_batch.to(device)
+
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+
+            final_loss += loss.item() * X_batch.size(0)
+            preds = (outputs >= 0.5).float()
+            final_correct += (preds == y_batch).sum().item()
+            final_total += y_batch.size(0)
+
+    final_loss /= final_total
+    final_accuracy = final_correct / final_total
+
+    print(f"\nFinal Validation Loss: {final_loss:.4f}")
+    print(f"Final Validation Accuracy: {final_accuracy:.4f}")
+
+if __name__ == "__main__":
+    main()
+
